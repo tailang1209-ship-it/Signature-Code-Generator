@@ -131,7 +131,7 @@ function combineEntropy(shareEntropyHexes: string[]): string {
 }
 
 // ─── Tab types ────────────────────────────────────────────────────────────────
-type Tab = "生成" | "拆分" | "合并" | "验证" | "监控";
+type Tab = "生成" | "拆分" | "合并" | "验证" | "监控" | "测试";
 
 // ─── Generate tab ─────────────────────────────────────────────────────────────
 function GenerateTab() {
@@ -810,8 +810,407 @@ function VerifyTab() {
   );
 }
 
+// ─── Auto Test tab ────────────────────────────────────────────────────────────
+// Full automated cold-wallet verification pipeline (100% local):
+//   Generate → Split (XOR) → Combine (XOR) → Verify (entropy match)
+// Uses setInterval so it keeps running when tab is hidden / screen is off.
+
+interface TestResult {
+  id: number;
+  strength: 128 | 192 | 256;
+  shares: number;
+  mnemonic: string;
+  originalEntropy: string;
+  shareEntropyList: string[];
+  recoveredEntropy: string;
+  recoveredMnemonic: string;
+  passed: boolean;
+  durationMs: number;
+  ts: number;
+}
+
+function playAlertChime() {
+  const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+  if (!Ctx) return;
+  const ctx = new Ctx();
+  const playTone = (freq: number, start: number, dur: number) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
+    gain.gain.setValueAtTime(0.15, ctx.currentTime + start);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + dur);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(ctx.currentTime + start);
+    osc.stop(ctx.currentTime + start + dur);
+  };
+  playTone(880, 0, 0.08);
+  playTone(440, 0.1, 0.12);
+}
+
+function runOneCycle(strength: 128 | 192 | 256, numShares: number, useRandom: boolean, id: number): TestResult {
+  const t0 = performance.now();
+
+  // 1. Generate
+  const mnemonic = bip39.generateMnemonic(strength);
+  const originalEntropy = bip39.mnemonicToEntropy(mnemonic);
+
+  // 2. Split
+  const shareEntropyList = splitEntropy(originalEntropy, numShares, useRandom);
+
+  // 3. Combine
+  const recoveredEntropy = combineEntropy(shareEntropyList);
+
+  // 4. Verify
+  const recoveredMnemonic = bip39.entropyToMnemonic(recoveredEntropy);
+  const passed = recoveredEntropy === originalEntropy && bip39.validateMnemonic(recoveredMnemonic);
+
+  return {
+    id,
+    strength,
+    shares: numShares,
+    mnemonic,
+    originalEntropy,
+    shareEntropyList,
+    recoveredEntropy,
+    recoveredMnemonic,
+    passed,
+    durationMs: performance.now() - t0,
+    ts: Date.now(),
+  };
+}
+
+function TestTab() {
+  const [strength, setStrength] = useState<128 | 192 | 256>(128);
+  const [numShares, setNumShares] = useState(2);
+  const [useRandom, setUseRandom] = useState(true);
+  const [intervalMs, setIntervalMs] = useState(1200);
+  const [isRunning, setIsRunning] = useState(false);
+  const [results, setResults] = useState<TestResult[]>([]);
+  const [totalRuns, setTotalRuns] = useState(0);
+  const [totalPassed, setTotalPassed] = useState(0);
+  const [totalFailed, setTotalFailed] = useState(0);
+  const counterRef = useRef(0);
+  const [expanded, setExpanded] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!isRunning) return;
+
+    const tick = () => {
+      counterRef.current += 1;
+      const result = runOneCycle(strength, numShares, useRandom, counterRef.current);
+      if (!result.passed) playAlertChime();
+      setResults((prev) => [result, ...prev].slice(0, 50));
+      setTotalRuns((n) => n + 1);
+      if (result.passed) setTotalPassed((n) => n + 1);
+      else setTotalFailed((n) => n + 1);
+    };
+
+    tick(); // run immediately on start
+    const id = setInterval(tick, intervalMs);
+    return () => clearInterval(id);
+  }, [isRunning, strength, numShares, useRandom, intervalMs]);
+
+  const reset = () => {
+    setIsRunning(false);
+    setResults([]);
+    setTotalRuns(0);
+    setTotalPassed(0);
+    setTotalFailed(0);
+    counterRef.current = 0;
+  };
+
+  const passRate = totalRuns > 0 ? ((totalPassed / totalRuns) * 100).toFixed(1) : "—";
+
+  const strengthOptions = [
+    { label: "12词 128bit", value: 128 as const },
+    { label: "18词 192bit", value: 192 as const },
+    { label: "24词 256bit", value: 256 as const },
+  ];
+
+  const intervalOptions = [
+    { label: "600ms", value: 600 },
+    { label: "1.2s", value: 1200 },
+    { label: "2s", value: 2000 },
+    { label: "5s", value: 5000 },
+  ];
+
+  return (
+    <div className="flex flex-col gap-6">
+      {/* Config + stats row */}
+      <div className="flex flex-col lg:flex-row gap-6">
+        {/* Config card */}
+        <Card className="bg-card/50 border-border/50 w-full lg:w-80 shrink-0">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm text-muted-foreground uppercase tracking-widest">自动测试配置</CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-5">
+            <div className="space-y-2">
+              <label className="text-xs text-muted-foreground uppercase tracking-widest">助记词长度</label>
+              <div className="flex flex-col gap-1.5">
+                {strengthOptions.map((o) => (
+                  <button
+                    key={o.value}
+                    data-testid={`test-strength-${o.value}`}
+                    onClick={() => setStrength(o.value)}
+                    disabled={isRunning}
+                    className={`px-3 py-2 rounded text-xs text-left border transition-all disabled:opacity-40 ${
+                      strength === o.value
+                        ? "bg-primary/10 border-primary/50 text-primary"
+                        : "bg-background border-border text-muted-foreground hover:border-primary/30"
+                    }`}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs text-muted-foreground uppercase tracking-widest">Share 数量</label>
+              <div className="flex gap-2">
+                {[2, 3, 4, 5].map((n) => (
+                  <button
+                    key={n}
+                    data-testid={`test-shares-${n}`}
+                    onClick={() => setNumShares(n)}
+                    disabled={isRunning}
+                    className={`flex-1 h-9 rounded text-sm font-mono border transition-all disabled:opacity-40 ${
+                      numShares === n
+                        ? "bg-primary/10 border-primary/50 text-primary"
+                        : "bg-background border-border text-muted-foreground hover:border-primary/30"
+                    }`}
+                  >
+                    {n}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs text-muted-foreground uppercase tracking-widest">刷新间隔</label>
+              <div className="grid grid-cols-2 gap-1.5">
+                {intervalOptions.map((o) => (
+                  <button
+                    key={o.value}
+                    data-testid={`test-interval-${o.value}`}
+                    onClick={() => setIntervalMs(o.value)}
+                    disabled={isRunning}
+                    className={`px-2 py-1.5 rounded text-xs border transition-all disabled:opacity-40 ${
+                      intervalMs === o.value
+                        ? "bg-primary/10 border-primary/50 text-primary"
+                        : "bg-background border-border text-muted-foreground hover:border-primary/30"
+                    }`}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs text-muted-foreground uppercase tracking-widest">Split 模式</label>
+              <div className="flex gap-2">
+                {[{ label: "Random", v: true }, { label: "Deterministic", v: false }].map((o) => (
+                  <button
+                    key={String(o.v)}
+                    onClick={() => setUseRandom(o.v)}
+                    disabled={isRunning}
+                    className={`flex-1 py-1.5 rounded text-xs border transition-all disabled:opacity-40 ${
+                      useRandom === o.v
+                        ? "bg-primary/10 border-primary/50 text-primary"
+                        : "bg-background border-border text-muted-foreground hover:border-primary/30"
+                    }`}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="pt-2 border-t border-border/40 flex gap-2">
+              <Button
+                data-testid="btn-test-toggle"
+                onClick={() => setIsRunning((r) => !r)}
+                className={`flex-1 font-bold ${
+                  isRunning
+                    ? "bg-destructive hover:bg-destructive/90 text-destructive-foreground"
+                    : "bg-primary hover:bg-primary/90 text-primary-foreground"
+                }`}
+              >
+                {isRunning ? "停止测试" : "开始测试"}
+              </Button>
+              <Button
+                variant="ghost"
+                data-testid="btn-test-reset"
+                onClick={reset}
+                className="text-muted-foreground hover:text-foreground px-3"
+              >
+                <RotateCcw className="w-4 h-4" />
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Stats */}
+        <div className="flex-1 flex flex-col gap-4">
+          {/* Status bar */}
+          <div className="flex items-center gap-3 text-sm">
+            {isRunning ? (
+              <span className="flex items-center gap-1.5 text-primary font-semibold">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-primary" />
+                </span>
+                RUNNING — 黑屏后台继续运行
+              </span>
+            ) : (
+              <span className="flex items-center gap-1.5 text-muted-foreground">
+                <Circle className="w-2 h-2 fill-muted-foreground" /> IDLE
+              </span>
+            )}
+          </div>
+
+          {/* Counters */}
+          <div className="grid grid-cols-3 gap-3">
+            {[
+              { label: "总轮次", value: totalRuns.toLocaleString(), color: "text-foreground" },
+              { label: "通过", value: totalPassed.toLocaleString(), color: "text-primary" },
+              { label: "失败", value: totalFailed.toLocaleString(), color: totalFailed > 0 ? "text-destructive" : "text-muted-foreground" },
+            ].map((s) => (
+              <Card key={s.label} className="bg-card/40 border-border/40">
+                <CardContent className="p-4 text-center">
+                  <div className={`text-2xl font-bold font-mono ${s.color}`}>{s.value}</div>
+                  <div className="text-xs text-muted-foreground mt-1 uppercase tracking-widest">{s.label}</div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+
+          {/* Pass rate */}
+          <Card className="bg-card/30 border-border/30">
+            <CardContent className="p-4 flex items-center justify-between">
+              <span className="text-xs text-muted-foreground uppercase tracking-widest">通过率</span>
+              <span className={`text-xl font-mono font-bold ${
+                totalFailed > 0 ? "text-destructive" : totalRuns > 0 ? "text-primary" : "text-muted-foreground"
+              }`}>
+                {passRate}{totalRuns > 0 ? "%" : ""}
+              </span>
+            </CardContent>
+          </Card>
+
+          {/* Pipeline diagram */}
+          <Card className="bg-card/20 border-border/20">
+            <CardContent className="p-4 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+              {["生成 Entropy", `XOR 拆分 ×${numShares}`, `XOR 合并 ×${numShares}`, "验证一致性"].map((step, i, arr) => (
+                <span key={step} className="flex items-center gap-2">
+                  <span className={`px-2 py-1 rounded border font-mono whitespace-nowrap ${
+                    isRunning ? "border-primary/40 text-primary/80 bg-primary/5" : "border-border/40"
+                  }`}>{step}</span>
+                  {i < arr.length - 1 && <span className="text-muted-foreground/40">→</span>}
+                </span>
+              ))}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+
+      {/* Results log */}
+      {results.length > 0 && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-muted-foreground uppercase tracking-widest">测试日志（最近 50 条）</p>
+            <span className="text-xs text-muted-foreground">{intervalMs}ms / 轮</span>
+          </div>
+          <div className="space-y-1.5 max-h-[480px] overflow-y-auto pr-1">
+            <AnimatePresence initial={false}>
+              {results.map((r) => (
+                <motion.div
+                  key={r.id}
+                  initial={{ opacity: 0, y: -8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.15 }}
+                >
+                  <Card
+                    className={`border cursor-pointer transition-colors ${
+                      r.passed
+                        ? "bg-primary/5 border-primary/20 hover:border-primary/40"
+                        : "bg-destructive/5 border-destructive/30 hover:border-destructive/50"
+                    }`}
+                    onClick={() => setExpanded(expanded === r.id ? null : r.id)}
+                  >
+                    <CardContent className="p-3">
+                      <div className="flex items-center gap-3">
+                        {r.passed
+                          ? <CheckCircle2 className="w-4 h-4 text-primary shrink-0" />
+                          : <XCircle className="w-4 h-4 text-destructive shrink-0" />
+                        }
+                        <span className="text-xs font-mono text-muted-foreground w-8">#{r.id}</span>
+                        <span className={`text-xs font-semibold ${r.passed ? "text-primary" : "text-destructive"}`}>
+                          {r.passed ? "PASS" : "FAIL"}
+                        </span>
+                        <span className="text-xs text-muted-foreground flex-1 truncate font-mono">{r.mnemonic}</span>
+                        <span className="text-xs text-muted-foreground shrink-0">{r.shares} shares</span>
+                        <span className="text-xs text-muted-foreground shrink-0">{r.durationMs.toFixed(1)}ms</span>
+                      </div>
+
+                      {expanded === r.id && (
+                        <motion.div
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: "auto" }}
+                          className="mt-3 pt-3 border-t border-border/30 space-y-2 text-[10px] font-mono"
+                        >
+                          <div className="space-y-1">
+                            <span className="text-muted-foreground uppercase">Original Entropy</span>
+                            <p className="text-foreground/80 break-all">{r.originalEntropy}</p>
+                          </div>
+                          {r.shareEntropyList.map((se, i) => (
+                            <div key={i} className="space-y-1">
+                              <span className="text-muted-foreground uppercase">Share {i + 1} Entropy</span>
+                              <p className="text-primary/70 break-all">{se}</p>
+                            </div>
+                          ))}
+                          <div className="space-y-1">
+                            <span className="text-muted-foreground uppercase">Recovered Entropy</span>
+                            <p className={`break-all ${r.passed ? "text-primary" : "text-destructive"}`}>{r.recoveredEntropy}</p>
+                          </div>
+                          <div className="space-y-1">
+                            <span className="text-muted-foreground uppercase">Match</span>
+                            <p className={r.passed ? "text-primary" : "text-destructive"}>
+                              {r.passed ? "✓ Original === Recovered" : "✗ MISMATCH — entropy corrupted"}
+                            </p>
+                          </div>
+                          <div className="space-y-1">
+                            <span className="text-muted-foreground uppercase">Recovered Mnemonic</span>
+                            <p className="text-foreground/70 break-all">{r.recoveredMnemonic}</p>
+                          </div>
+                        </motion.div>
+                      )}
+                    </CardContent>
+                  </Card>
+                </motion.div>
+              ))}
+            </AnimatePresence>
+          </div>
+        </div>
+      )}
+
+      {results.length === 0 && !isRunning && (
+        <Card className="bg-card/20 border-border/20 border-dashed">
+          <CardContent className="p-8 text-center text-muted-foreground">
+            <Activity className="w-8 h-8 mx-auto mb-3 opacity-30" />
+            <p className="text-sm">点击"开始测试"启动全自动流水线</p>
+            <p className="text-xs mt-1 opacity-60">生成 → XOR 拆分 → XOR 合并 → 验证，每轮全自动执行</p>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 // ─── Root App ────────────────────────────────────────────────────────────────
-const TABS: Tab[] = ["生成", "拆分", "合并", "验证"];
+const TABS: Tab[] = ["生成", "拆分", "合并", "验证", "测试"];
 
 function SeedXORApp() {
   const [activeTab, setActiveTab] = useState<Tab>("生成");
@@ -866,6 +1265,7 @@ function SeedXORApp() {
             {activeTab === "拆分" && <SplitTab />}
             {activeTab === "合并" && <CombineTab />}
             {activeTab === "验证" && <VerifyTab />}
+            {activeTab === "测试" && <TestTab />}
           </motion.div>
         </AnimatePresence>
       </main>
